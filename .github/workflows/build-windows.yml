@@ -38,9 +38,10 @@ jobs:
       - name: Smoke-test packaged executable
         shell: pwsh
         run: |
-          & .\dist\YouTube_MP3.exe --self-test
-          if ($LASTEXITCODE -ne 0) {
-            throw "Packaged executable self-test failed with exit code $LASTEXITCODE"
+          $process = Start-Process -FilePath ".\dist\YouTube_MP3.exe" -ArgumentList "--self-test" -Wait -PassThru
+          Write-Host "Packaged executable self-test exit code: $($process.ExitCode)"
+          if ($process.ExitCode -ne 0) {
+            throw "Packaged executable self-test failed with exit code $($process.ExitCode)"
           }
 
       - name: Upload Windows executable
