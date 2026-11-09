@@ -1,0 +1,4 @@
+yt-dlp>=2024.10.22
+imageio-ffmpeg>=0.5.1
+pytest>=8.0
+PyInstaller>=6.10
