@@ -2,13 +2,18 @@ from __future__ import annotations
 
 import argparse
 import ctypes
+import math
 import os
 import queue
 import re
+import shutil
+import struct
 import subprocess
 import sys
+import tempfile
 import threading
 import uuid
+import wave
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
@@ -21,6 +26,9 @@ from tkinter import ttk
 
 APP_TITLE = "YouTube MP3 Downloader"
 VIDEO_ID_RE = re.compile(r"^[A-Za-z0-9_-]{11}$")
+MP3GAIN_REFERENCE_DB = 89.0
+MIN_TARGET_DB = 75.0
+MAX_TARGET_DB = 100.0
 SUPPORTED_HOSTS = {
     "youtube.com",
     "www.youtube.com",
@@ -104,11 +112,129 @@ def get_download_directory(create: bool = True) -> Path:
     return downloads
 
 
+def validate_target_volume(value: str | float) -> float:
+    """Validate the MP3Gain ReplayGain target volume in dB."""
+    try:
+        target = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("目標音量必須是數字，例如 89.0。") from exc
+
+    if not math.isfinite(target) or not MIN_TARGET_DB <= target <= MAX_TARGET_DB:
+        raise ValueError(f"目標音量請設定在 {MIN_TARGET_DB:.0f} 至 {MAX_TARGET_DB:.0f} dB 之間。")
+    return target
+
+
+def find_mp3gain_executable() -> Path | None:
+    """Find the bundled MP3Gain CLI or a source-tree/local installation."""
+    bundle_dir = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
+    candidates = [
+        bundle_dir / "mp3gain.exe",
+        bundle_dir / "vendor" / "mp3gain.exe",
+        Path(__file__).resolve().parent / "vendor" / "mp3gain.exe",
+        Path(sys.executable).resolve().parent / "mp3gain.exe",
+    ]
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate
+
+    if os.name != "nt":
+        import shutil as shutil_module
+        located = shutil_module.which("mp3gain")
+        if located:
+            return Path(located)
+    return None
+
+
+def normalize_mp3_volume(
+    mp3_path: Path,
+    target_db: str | float,
+    progress_callback=None,
+    status_callback=None,
+) -> None:
+    """Apply MP3Gain Track Gain with clipping protection, without re-encoding."""
+    target = validate_target_volume(target_db)
+    executable = find_mp3gain_executable()
+    if executable is None:
+        raise DownloadFailure(
+            "找不到 MP3Gain 音量調整元件。\n"
+            "建議：請重新下載最新 GitHub Windows 建置版本；若使用原始碼執行，"
+            "請將 mp3gain.exe 放入 vendor 資料夾。"
+        )
+
+    progress_callback = progress_callback or (lambda *_args: None)
+    status_callback = status_callback or (lambda *_args: None)
+    status_callback(f"正在分析音訊響度並調整至 {target:.1f} dB…")
+
+    # The classic MP3Gain Windows CLI has limited Unicode-path handling.
+    # Process a short ASCII filename in a temporary directory, then atomically
+    # replace the final file only after MP3Gain completes successfully.
+    staged_output: Path | None = None
+    try:
+        with tempfile.TemporaryDirectory(prefix="ytmp3gain_") as temp_dir:
+            staged_mp3 = Path(temp_dir) / "audio.mp3"
+            shutil.copy2(mp3_path, staged_mp3)
+            offset_db = target - MP3GAIN_REFERENCE_DB
+            command = [
+                str(executable),
+                "-r",       # Track Gain: normalize each song independently.
+                "-k",       # Avoid clipping; may limit gain below the requested target.
+                "-d",
+                f"{offset_db:.2f}",
+                str(staged_mp3),
+            ]
+            creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
+            progress_callback(98.0, "正在以 MP3Gain 分析並調整音量…")
+            result = subprocess.run(
+                command,
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                text=True,
+                errors="replace",
+                timeout=300,
+                creationflags=creationflags,
+            )
+            if result.returncode != 0:
+                details = "\n".join(part for part in (result.stdout, result.stderr) if part).strip()
+                raise DownloadFailure(
+                    "MP3 已下載，但 MP3Gain 音量標準化失敗；原始 MP3 未被覆寫。\n"
+                    "建議：請確認檔案可正常播放、磁碟空間足夠，再重新下載或更新程式。"
+                    + (f"\n詳細錯誤：{details[-1200:]}" if details else "")
+                )
+            if not staged_mp3.is_file() or staged_mp3.stat().st_size == 0:
+                raise DownloadFailure("MP3Gain 執行後沒有產生有效檔案；原始 MP3 未被覆寫。")
+
+            staged_output = mp3_path.with_name(f".{mp3_path.stem}.{uuid.uuid4().hex}.gain.tmp")
+            shutil.copy2(staged_mp3, staged_output)
+            os.replace(staged_output, mp3_path)
+            staged_output = None
+    except subprocess.TimeoutExpired as exc:
+        raise DownloadFailure(
+            "MP3 已下載，但音量標準化逾時；原始 MP3 未被覆寫。"
+            "請確認檔案大小與磁碟狀態後再試。"
+        ) from exc
+    except DownloadFailure:
+        raise
+    except Exception as exc:
+        raise DownloadFailure(
+            f"MP3 已下載，但音量標準化失敗；原始 MP3 未被覆寫。詳細錯誤：{exc}"
+        ) from exc
+    finally:
+        if staged_output is not None:
+            staged_output.unlink(missing_ok=True)
+
+    progress_callback(99.5, f"音量調整完成（目標 {target:.1f} dB；防削波保護已啟用）")
+
+
 def classify_error(error: BaseException | str) -> tuple[str, str]:
-    """Map common network/YouTube/FFmpeg errors to actionable guidance."""
+    """Map common network/YouTube/FFmpeg/MP3Gain errors to actionable guidance."""
     message = str(error)
     lowered = message.lower()
 
+    if "mp3gain" in lowered or "音量標準化" in message:
+        return (
+            "MP3 音量標準化失敗",
+            "原始 MP3 會保留；請確認檔案可正常播放、磁碟空間足夠，並重新下載最新版程式。",
+        )
     if any(word in lowered for word in ("ffmpeg", "ffprobe", "postprocessing", "post-processing")):
         return (
             "音訊轉換失敗（FFmpeg）",
@@ -182,9 +308,11 @@ def download_video_as_mp3(
     url: str,
     progress_callback,
     status_callback,
+    target_db: str | float = MP3GAIN_REFERENCE_DB,
 ) -> tuple[Path, str]:
-    """Download one authorized video and return its MP3 path and title."""
+    """Download one authorized video, convert to MP3, then normalize its volume."""
     validated_url = parse_video_url(url)
+    target_db = validate_target_volume(target_db)
     download_dir = get_download_directory()
     ffmpeg_path = imageio_ffmpeg.get_ffmpeg_exe()
     if not ffmpeg_path or not Path(ffmpeg_path).is_file():
@@ -234,6 +362,15 @@ def download_video_as_mp3(
                     raise DownloadFailure(
                         f"轉換程序結束，但找不到輸出的 MP3 檔案。預期位置：{expected_mp3}"
                     )
+
+            status_callback(f"下載與 MP3 轉換完成，開始音量標準化（目標 {target_db:.1f} dB）…")
+            normalize_mp3_volume(
+                expected_mp3,
+                target_db,
+                progress_callback=progress_callback,
+                status_callback=status_callback,
+            )
+            progress_callback(100.0, f"完成：音量已調整至目標 {target_db:.1f} dB（防削波保護）")
             return expected_mp3, str(info.get("title") or expected_mp3.stem)
     except DownloadFailure:
         raise
@@ -259,8 +396,8 @@ class DownloaderApp:
         self.worker: threading.Thread | None = None
 
         root.title(APP_TITLE)
-        root.geometry("760x570")
-        root.minsize(680, 520)
+        root.geometry("760x620")
+        root.minsize(680, 570)
         root.configure(bg=self.BG)
         root.resizable(True, True)
 
@@ -352,6 +489,31 @@ class DownloaderApp:
         self.paste_button = ttk.Button(entry_row, text="貼上", style="Secondary.TButton", command=self.paste_from_clipboard)
         self.paste_button.pack(side="left", padx=(9, 0))
 
+        gain_row = ttk.Frame(card, style="Panel.TFrame")
+        gain_row.pack(fill="x", pady=(12, 0))
+        ttk.Label(
+            gain_row,
+            text="目標音量",
+            style="Panel.TLabel",
+            font=("Segoe UI", 10, "bold"),
+        ).pack(side="left")
+        self.target_db_var = tk.StringVar(value=f"{MP3GAIN_REFERENCE_DB:.1f}")
+        self.target_db_spin = ttk.Spinbox(
+            gain_row,
+            from_=MIN_TARGET_DB,
+            to=MAX_TARGET_DB,
+            increment=0.5,
+            format="%.1f",
+            textvariable=self.target_db_var,
+            width=8,
+        )
+        self.target_db_spin.pack(side="left", padx=(12, 8))
+        ttk.Label(
+            gain_row,
+            text="dB  ·  預設 89.0；啟用防削波保護",
+            style="PanelMuted.TLabel",
+        ).pack(side="left")
+
         self.download_button = ttk.Button(
             card, text="↓  下載 MP3", style="Accent.TButton", command=self.start_download
         )
@@ -397,7 +559,7 @@ class DownloaderApp:
         footer.pack(fill="x", pady=(13, 0))
         ttk.Label(
             footer,
-            text="輸出位置：Windows 使用者的「下載」資料夾  ·  MP3 VBR 0",
+            text="輸出位置：Windows 使用者的「下載」資料夾  ·  MP3 VBR 0  ·  MP3Gain",
             style="Muted.TLabel",
         ).pack(side="left")
         self.open_button = ttk.Button(footer, text="開啟下載資料夾", style="Secondary.TButton", command=self.open_download_folder)
@@ -444,6 +606,7 @@ class DownloaderApp:
             return
         try:
             url = parse_video_url(self.url_var.get())
+            target_db = validate_target_volume(self.target_db_var.get())
         except ValueError as exc:
             self.status_var.set(str(exc))
             self._append_log(str(exc), "error")
@@ -457,17 +620,18 @@ class DownloaderApp:
         self.status_var.set("正在準備下載…")
         self._append_log("開始處理單支影片…")
 
-        self.worker = threading.Thread(target=self._download_worker, args=(url,), daemon=True)
+        self.worker = threading.Thread(target=self._download_worker, args=(url, target_db), daemon=True)
         self.worker.start()
 
-    def _download_worker(self, url: str) -> None:
+    def _download_worker(self, url: str, target_db: float) -> None:
         try:
             path, title = download_video_as_mp3(
                 url,
                 lambda value, message: self.events.put(("progress", (value, message))),
                 lambda message: self.events.put(("status", message)),
+                target_db,
             )
-            self.events.put(("success", (path, title)))
+            self.events.put(("success", (path, title, target_db)))
         except Exception as exc:
             self.events.put(("error", str(exc)))
 
@@ -483,14 +647,18 @@ class DownloaderApp:
                 elif event == "status":
                     self.status_var.set(payload)
                 elif event == "success":
-                    path, title = payload
+                    path, title, target_db = payload
                     self.busy = False
                     self.download_button.configure(state="normal")
                     self.paste_button.configure(state="normal")
                     self.progress.configure(value=100)
                     self.percent_label.configure(text="100%")
-                    self.status_var.set("下載成功！MP3 已儲存。")
+                    self.status_var.set("下載與音量調整完成！MP3 已儲存。")
                     self._append_log(f"成功：{title}", "success")
+                    self._append_log(
+                        f"目標音量：{target_db:.1f} dB（MP3Gain Track Gain；防削波保護）",
+                        "success",
+                    )
                     self._append_log(f"檔案：{path}", "success")
                 elif event == "error":
                     self.busy = False
@@ -519,17 +687,49 @@ class DownloaderApp:
 
 
 def self_test() -> int:
-    """Smoke-test the packaged runtime without opening the graphical interface."""
+    """Smoke-test the frozen runtime, FFmpeg conversion, and MP3Gain processing."""
     try:
         ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
         if not ffmpeg or not Path(ffmpeg).is_file():
             return 2
-        # Ensure yt-dlp and the MP3 postprocessor are importable in a frozen build.
         if not hasattr(yt_dlp, "YoutubeDL"):
             return 3
+        if find_mp3gain_executable() is None:
+            return 5
         options = build_ydl_options(Path.cwd(), ffmpeg, lambda *_: None, lambda *_: None)
         if options.get("noplaylist") is not True:
             return 4
+
+        # Create a short synthetic WAV, encode it with the bundled FFmpeg, then
+        # run the actual MP3Gain CLI. This validates both bundled native tools.
+        sample_rate = 44100
+        with tempfile.TemporaryDirectory(prefix="ytmp3_selftest_") as temp_dir:
+            wav_path = Path(temp_dir) / "tone.wav"
+            mp3_path = Path(temp_dir) / "tone.mp3"
+            samples = bytearray()
+            for index in range(sample_rate * 3):
+                sample = int(8000 * math.sin(2 * math.pi * 440 * index / sample_rate))
+                samples.extend(struct.pack("<h", sample))
+            with wave.open(str(wav_path), "wb") as wav_file:
+                wav_file.setnchannels(1)
+                wav_file.setsampwidth(2)
+                wav_file.setframerate(sample_rate)
+                wav_file.writeframes(samples)
+
+            encoded = subprocess.run(
+                [
+                    ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
+                    "-i", str(wav_path), "-codec:a", "libmp3lame", "-q:a", "5",
+                    str(mp3_path),
+                ],
+                capture_output=True,
+                timeout=60,
+            )
+            if encoded.returncode != 0 or not mp3_path.is_file() or mp3_path.stat().st_size == 0:
+                return 6
+            normalize_mp3_volume(mp3_path, MP3GAIN_REFERENCE_DB)
+            if not mp3_path.is_file() or mp3_path.stat().st_size == 0:
+                return 7
         return 0
     except Exception:
         return 1
