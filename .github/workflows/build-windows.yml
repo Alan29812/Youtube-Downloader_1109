@@ -28,12 +28,27 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
+      - name: Download MP3Gain command-line backend
+        shell: pwsh
+        run: |
+          $archive = Join-Path $env:RUNNER_TEMP "mp3gain-win-1_2_5.zip"
+          $extract = Join-Path $env:RUNNER_TEMP "mp3gain-extract"
+          $url = "https://downloads.sourceforge.net/project/mp3gain/MP3Gain-Windows%20%28Stable%29/1.2.5/mp3gain-win-1_2_5.zip?download"
+          curl.exe -L --fail --retry 3 --retry-delay 2 -o $archive $url
+          if ($LASTEXITCODE -ne 0) { throw "Unable to download the official MP3Gain archive." }
+          Expand-Archive -Path $archive -DestinationPath $extract -Force
+          $cli = Get-ChildItem -Path $extract -Filter "mp3gain.exe" -File -Recurse | Select-Object -First 1
+          if ($null -eq $cli) { throw "mp3gain.exe was not found in the official archive." }
+          New-Item -ItemType Directory -Force -Path "vendor" | Out-Null
+          Copy-Item $cli.FullName "vendor/mp3gain.exe" -Force
+          Write-Host "Bundled MP3Gain CLI: $($cli.FullName)"
+
       - name: Run unit tests
         run: python -m pytest -q
 
       - name: Build one-file GUI executable
         run: |
-          python -m PyInstaller --noconfirm --clean --onefile --windowed --name YouTube_MP3 --collect-data yt_dlp --collect-submodules yt_dlp.extractor --collect-submodules yt_dlp.postprocessor --collect-all imageio_ffmpeg youtube_mp3_downloader.py
+          python -m PyInstaller --noconfirm --clean --onefile --windowed --name YouTube_MP3 --add-binary "vendor/mp3gain.exe;." --collect-data yt_dlp --collect-submodules yt_dlp.extractor --collect-submodules yt_dlp.postprocessor --collect-all imageio_ffmpeg youtube_mp3_downloader.py
 
       - name: Smoke-test packaged executable
         shell: pwsh
