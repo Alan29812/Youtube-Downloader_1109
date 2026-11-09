@@ -59,10 +59,17 @@ jobs:
             throw "Packaged executable self-test failed with exit code $($process.ExitCode)"
           }
 
+      - name: Include third-party notices
+        shell: pwsh
+        run: |
+          Copy-Item "THIRD_PARTY_NOTICES.md" "dist/THIRD_PARTY_NOTICES.md" -Force
+
       - name: Upload Windows executable
         uses: actions/upload-artifact@v4
         with:
           name: YouTube-MP3-Windows
-          path: dist/YouTube_MP3.exe
+          path: |
+            dist/YouTube_MP3.exe
+            dist/THIRD_PARTY_NOTICES.md
           if-no-files-found: error
           retention-days: 30
