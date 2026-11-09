@@ -1,0 +1,52 @@
+name: Build Windows executable
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run unit tests
+        run: pytest -q
+
+      - name: Build one-file GUI executable
+        run: |
+          python -m PyInstaller --noconfirm --clean --onefile --windowed --name YouTube_MP3 --collect-data yt_dlp --collect-submodules yt_dlp.extractor --collect-submodules yt_dlp.postprocessor --collect-all imageio_ffmpeg youtube_mp3_downloader.py
+
+      - name: Smoke-test packaged executable
+        shell: pwsh
+        run: |
+          & .\dist\YouTube_MP3.exe --self-test
+          if ($LASTEXITCODE -ne 0) {
+            throw "Packaged executable self-test failed with exit code $LASTEXITCODE"
+          }
+
+      - name: Upload Windows executable
+        uses: actions/upload-artifact@v4
+        with:
+          name: YouTube-MP3-Windows
+          path: dist/YouTube_MP3.exe
+          if-no-files-found: error
+          retention-days: 30
